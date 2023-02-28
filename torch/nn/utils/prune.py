@@ -815,6 +815,130 @@ class CustomFromMask(BasePruningMethod):
         """
         return super(CustomFromMask, cls).apply(module, name, mask=mask)
 
+class FPGMStructured(BasePruningMethod):
+    r"""Prune entire (currently unpruned) fliters in a tensor according to distances
+    among filters according to 
+    "Filter Pruning via Geometric Median for Deep Convolutional Neural Networks Acceleration"
+    https://arxiv.org/abs/1811.00250.
+    Args:
+        amount (int or float): quantity of fliters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of filters to prune. If ``int``, it represents the
+            absolute number of filters to prune.
+        dist_type (str): distance measurement type, options are ["l2", 
+            "l1"].
+        dim (int, optional): index of the dim along which we define
+            filters to prune. Default: 0.
+    """
+
+    PRUNING_TYPE = "structured"
+
+    def __init__(self, amount, dist_type='l2', dim=0):
+        # Check range of validity of amount
+        _validate_pruning_amount_init(amount)
+        self.amount = amount
+        self.dist_type = dist_type
+        self.dim = dim
+
+    def compute_mask(self, t, default_mask):
+        r"""Computes and returns a mask for the input tensor ``t``.
+        Starting from a base ``default_mask`` (which should be a mask of ones
+        if the tensor has not been pruned yet), generate a random mask to
+        apply on top of the ``default_mask`` by zeoring out relatively high
+        similarity filters.
+
+        Args:
+            t (torch.Tensor): tensor representing the parameter to prune
+            default_mask (torch.Tensor): Base mask from previous pruning
+                iterations, that need to be respected after the new mask is
+                applied. Same dims as ``t``.
+        Returns:
+            mask (torch.Tensor): mask to apply to ``t``, of same dims as ``t``
+        Raises:
+            IndexError: if ``self.dim >= len(t.shape)``
+            ValueError: if ``self.dist_type is not in ['l2', 'l1']``
+            ValueError: if ``t.dim() != 4``
+        """
+        # Check that tensor has structure (i.e. more than 1 dimension) such
+        # that the concept of "channels" makes sense
+        _validate_structured_pruning(t)
+
+        # Check that self.dim is a valid dim to index t, else raise IndexError
+        _validate_pruning_dim(t, self.dim)
+
+        # Check that the amount of channels to prune is not > than the number of
+        # channels in t along the dim to prune
+        tensor_size = t.shape[self.dim]
+        # Compute number of units to prune: amount if int,
+        # else amount * tensor_size
+
+        nparams_toprune = _compute_nparams_toprune(self.amount, tensor_size)
+        nparams_tokeep = tensor_size - nparams_toprune
+
+        # This should raise an error if the number of units to prune is larger
+        # than the number of units in the tensor
+        _validate_pruning_amount(nparams_toprune, tensor_size)
+            
+        # This should raise an error if the distance measurement type is not supported
+        _validate_distance_type(self.dist_type, ['l2', 'l1'])
+
+        distance = _compute_distance(t, self.dim, self.dist_type)
+
+        topk = torch.topk(distance, k=nparams_tokeep, largest=True)
+
+        # validate the convolutional layer
+        if t.dim() != 4:
+            raise ValueError("Only support 4D convolutional layer")
+
+        def make_mask(t, dim, indices):
+            # init mask to 0
+            mask = torch.zeros_like(t)
+            # e.g.: slc = [None, None, None], if len(t.shape) = 3
+            slc = [slice(None)] * t.dim()
+            # replace a None at position=dim with indices
+            # e.g.: slc = [None, None, [0, 2, 3]] if dim=2 & indices=[0,2,3]
+            slc[dim] = indices
+            # use slc to slice mask and replace all its entries with 1s
+            # e.g.: mask[:, :, [0, 2, 3]] = 1
+            mask[slc] = 1
+            return mask
+
+        if nparams_toprune == 0:    # k=0 not supported by torch.kthvalue
+            mask = default_mask
+        else:
+            # apply the new structured mask on top of prior mask
+            mask = make_mask(t, self.dim, topk.indices)
+            mask *= default_mask.to(dtype=mask.dtype)
+
+        return mask
+
+    @classmethod
+    def apply(cls, module, name, amount, dist_type, dim):
+        r"""Adds the forward pre-hook that enables pruning on the fly and
+        the reparametrization of a tensor in terms of the original tensor
+        and the pruning mask.
+
+        Args:
+            module (nn.Module): module containing the tensor to prune
+            name (str): parameter name within ``module`` on which pruning
+                will act.
+            amount (int or float): quantity of fliters to prune.
+                If ``float``, should be between 0.0 and 1.0 and represent the
+                fraction of filters to prune. If ``int``, it represents the
+                absolute number of filters to prune.
+            dist_type (str): distance measurement type, options are ["l2", 
+                "l1"]
+            dim (int, optional): index of the dim along which we define
+                filters to prune. Default: 0.
+        """
+        return super(FPGMStructured, cls).apply(
+            module,
+            name,
+            dim=dim,
+            amount=amount,
+            dist_type=dist_type
+        )
+
 
 def identity(module, name):
     r"""Applies pruning reparametrization to the tensor corresponding to the
@@ -1165,6 +1289,40 @@ def custom_from_mask(module, name, mask):
     CustomFromMask.apply(module, name, mask)
     return module
 
+def FPGM_structured(module, name, amount, dist_type, dim=0):
+    r"""Prunes tensor corresponding to parameter called ``name`` in ``module``
+    by removing the specified `amount` of (currently unpruned) units with the
+    lowest highest similarity among filters.
+
+    1) adding a named buffer called ``name+'_mask'`` corresponding to the
+       binary mask applied to the parameter ``name`` by the pruning method.
+    2) replacing the parameter ``name`` by its pruned version, while the
+       original (unpruned) parameter is stored in a new parameter named
+       ``name+'_orig'``.
+    
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (str): parameter name within ``module`` on which pruning
+                will act.
+        amount (int or float): quantity of fliters to prune.
+            If ``float``, should be between 0.0 and 1.0 and represent the
+            fraction of filters to prune. If ``int``, it represents the
+            absolute number of filters to prune.
+        dist_type (str): distance measurement type, options are ["l2", 
+            "l1"]. If "l2", l2 distance is used. If "l1", l1 distance is used.
+        dim (int, optional): index of the dim along which we define
+            filters to prune. Default: 0.
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input module
+
+    Examples:
+        >>> m = prune.FPGM_structured(nn.Conv2d(3,5,3), 'weight', amount=0.4, dist_type="l2", dim=0)
+        >>> m.state_dict().keys()
+        odict_keys(['bias', 'weight_orig', 'weight_mask'])
+
+    """
+    FPGMStructured.apply(module, name, amount, dist_type, dim)
+    return module
 
 def remove(module, name):
     r"""Removes the pruning reparameterization from a module and the
@@ -1360,3 +1518,51 @@ def _compute_norm(t, n, dim):
 
     norm = torch.norm(t, p=n, dim=dims)
     return norm
+
+def _validate_distance_type(dist_type, supported_dist_type_list):
+    r"""
+    Args:
+        dist_type (str): distance measurement type
+        supported_dist_type_list (list): list of supported distance measurement types
+            For example, supported_dist_type_list = ['l2', 'l1']
+    """
+    supported_dist_type = supported_dist_type_list
+    if dist_type not in supported_dist_type:
+        raise ValueError("Distance type {} not supported".format(dist_type))
+
+def _compute_distance(t, dim, dist_type):
+    r"""Compute distance across all entries in tensor `t` along all dimension
+    except for the one identified by dim.
+
+    Args:
+        t (torch.Tensor): tensor representing the parameter to prune
+        dim (int): dim identifying the filters to prune
+        dist_type (str): distance measurement type. Supported types are ['l1', 'l2']
+
+    Returns:
+        distance (torch.Tensor): distance computed across all dimensions except
+            for `dim`. By construction, `distance.shape = t.shape[dim]`.
+    """
+    # dims = all axes, except for the one identified by `dim`
+    dims = list(range(t.dim()))
+    # convert negative indexing
+    if dim < 0:
+        dim = dims[dim]
+    dims.remove(dim)
+
+    size = t.size(dim)
+    slc = [slice(None)] * t.dim()
+
+    # flatten the tensor along the dimension
+    t_flatten = [t[tuple(slc[:dim] + [i] + slc[dim+1:])].reshape(-1) for i in range(size)]
+    t_flatten = torch.stack(t_flatten)
+
+    # distance measurement
+    dist_matrix = torch.zeros(size, size)
+    if dist_type == "l2" or "l1":
+        dist_matrix = torch.cdist(t_flatten, t_flatten, p=2 if dist_type == "l2" else 1)
+
+    # more similar with other filter indicates large in the sum of row
+    distance = torch.sum(torch.abs(dist_matrix), 1)
+
+    return distance
